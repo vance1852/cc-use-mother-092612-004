@@ -12,15 +12,30 @@ from .errors import DomainError, ValidationError
 from .service import DomainService
 from .storage import Database
 
+try:  # 茶饮业务模块可选注入
+    from .tea.api import route_tea
+    from .tea.service import TeaService
+except ImportError:  # pragma: no cover - 茶饮模块随包提供，此处仅为防御
+    route_tea = None  # type: ignore
+    TeaService = None  # type: ignore
+
 
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
-          headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+          headers: dict[str, str] | None = None, tea: "TeaService | None" = None
+          ) -> tuple[int, dict[str, Any]]:
     """把一个 HTTP 语义请求分派到领域服务。"""
 
     headers = headers or {}
     body = body or {}
     parsed = urlparse(path)
     actor_id = headers.get("X-Actor-Id", "")
+    if parsed.path.startswith("/tea"):
+        if tea is None or route_tea is None:
+            return 404, {"error": "route_not_found", "message": "茶饮模块未启用"}
+        delegated = route_tea(tea, method, path, body, parsed, actor_id)
+        if delegated is not None:
+            return delegated
+        return 404, {"error": "route_not_found", "message": "接口不存在"}
     try:
         if method == "GET" and parsed.path == "/health":
             valid, count = service.verify_audit()
@@ -59,6 +74,7 @@ class Handler(BaseHTTPRequestHandler):
     """把标准库 HTTP 请求转换为路由调用。"""
 
     service: DomainService
+    tea: "TeaService | None" = None
 
     def _handle(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -69,7 +85,8 @@ class Handler(BaseHTTPRequestHandler):
             self._write(400, {"error": "invalid_json", "message": "请求体必须是 UTF-8 JSON"})
             return
         status, payload = route(self.service, self.command, self.path, body,
-                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")})
+                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")},
+                                tea=self.tea)
         self._write(status, payload)
 
     def _write(self, status: int, payload: dict[str, Any]) -> None:
@@ -100,6 +117,7 @@ def main() -> int:
     args = parser.parse_args()
     database = Database(args.database)
     Handler.service = DomainService(database)
+    Handler.tea = TeaService(database) if TeaService is not None else None
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
